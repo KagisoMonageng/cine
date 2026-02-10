@@ -1,17 +1,10 @@
-const { Pool } = require('pg')
+const { createClient } = require('@supabase/supabase-js')
 const env = require('./env')
 
-if (!env.databaseUrl) {
-  throw new Error('Missing DATABASE_URL in environment')
+if (!env.sup_url || !env.sup_anon) {
+  throw new Error('Missing SUPABASE_URL or SUPABASE_ANON_KEY in environment')
 }
 
-const sslConfig = env.nodeEnv === 'production'
-  ? { rejectUnauthorized: false }
-  : false
+const supabase = createClient(env.sup_url, env.sup_anon)
 
-const pool = new Pool({
-  connectionString: env.databaseUrl,
-  ssl: sslConfig
-})
-
-module.exports = pool
+module.exports = supabase

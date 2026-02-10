@@ -1,4 +1,4 @@
-const pool = require('../config/db')
+const supabase = require('../config/db')
 
 async function followUser (req, res) {
   const { userId } = req.params
@@ -7,17 +7,24 @@ async function followUser (req, res) {
     return res.status(400).json({ message: 'You cannot follow yourself' })
   }
 
-  const target = await pool.query('SELECT id FROM users WHERE id = $1', [userId])
-  if (target.rowCount === 0) {
+  const { data: target, error: targetError } = await supabase
+    .from('users')
+    .select('id')
+    .eq('id', userId)
+    .single()
+
+  if (targetError || !target) {
     return res.status(404).json({ message: 'User not found' })
   }
 
-  await pool.query(
-    `INSERT INTO follows (follower_id, following_id)
-     VALUES ($1, $2)
-     ON CONFLICT DO NOTHING`,
-    [req.user.userId, userId]
-  )
+  const { error } = await supabase
+    .from('follows')
+    .insert({
+      follower_id: req.user.userId,
+      following_id: userId
+    })
+
+  if (error && error.code !== '23505') throw error
 
   return res.status(201).json({ message: 'Now following user' })
 }
@@ -25,38 +32,47 @@ async function followUser (req, res) {
 async function unfollowUser (req, res) {
   const { userId } = req.params
 
-  await pool.query(
-    'DELETE FROM follows WHERE follower_id = $1 AND following_id = $2',
-    [req.user.userId, userId]
-  )
+  await supabase
+    .from('follows')
+    .delete()
+    .eq('follower_id', req.user.userId)
+    .eq('following_id', userId)
 
   return res.json({ message: 'Unfollowed user' })
 }
 
 async function listFollowing (req, res) {
-  const result = await pool.query(
-    `SELECT u.id, u.full_name, u.role, u.avatar_url
-     FROM follows f
-     JOIN users u ON u.id = f.following_id
-     WHERE f.follower_id = $1
-     ORDER BY f.created_at DESC`,
-    [req.user.userId]
-  )
+  const { data, error } = await supabase
+    .from('follows')
+    .select(`
+      created_at,
+      users!following_id (id, full_name, role, avatar_url)
+    `)
+    .eq('follower_id', req.user.userId)
+    .order('created_at', { ascending: false })
 
-  return res.json({ data: result.rows })
+  if (error) throw error
+
+  const formatted = data.map(f => f.users)
+
+  return res.json({ data: formatted })
 }
 
 async function listFollowers (req, res) {
-  const result = await pool.query(
-    `SELECT u.id, u.full_name, u.role, u.avatar_url
-     FROM follows f
-     JOIN users u ON u.id = f.follower_id
-     WHERE f.following_id = $1
-     ORDER BY f.created_at DESC`,
-    [req.user.userId]
-  )
+  const { data, error } = await supabase
+    .from('follows')
+    .select(`
+      created_at,
+      users!follower_id (id, full_name, role, avatar_url)
+    `)
+    .eq('following_id', req.user.userId)
+    .order('created_at', { ascending: false })
 
-  return res.json({ data: result.rows })
+  if (error) throw error
+
+  const formatted = data.map(f => f.users)
+
+  return res.json({ data: formatted })
 }
 
 async function createPost (req, res) {
@@ -66,50 +82,91 @@ async function createPost (req, res) {
     return res.status(400).json({ message: 'content is required' })
   }
 
-  const result = await pool.query(
-    `INSERT INTO posts (author_id, content)
-     VALUES ($1, $2)
-     RETURNING *`,
-    [req.user.userId, content.trim()]
-  )
+  const { data, error } = await supabase
+    .from('posts')
+    .insert({
+      author_id: req.user.userId,
+      content: content.trim()
+    })
+    .select()
+    .single()
 
-  return res.status(201).json({ data: result.rows[0] })
+  if (error) throw error
+
+  return res.status(201).json({ data })
 }
 
 async function listFeed (req, res) {
-  const result = await pool.query(
-    `SELECT p.id, p.author_id, p.content, p.created_at, p.updated_at,
-            u.full_name AS author_name, u.avatar_url,
-            COUNT(pl.user_id)::int AS likes_count,
-            BOOL_OR(pl.user_id = $1) AS liked_by_me
-     FROM posts p
-     JOIN users u ON u.id = p.author_id
-     LEFT JOIN post_likes pl ON pl.post_id = p.id
-     WHERE p.author_id = $1
-        OR p.author_id IN (SELECT following_id FROM follows WHERE follower_id = $1)
-     GROUP BY p.id, u.full_name, u.avatar_url
-     ORDER BY p.created_at DESC
-     LIMIT 100`,
-    [req.user.userId]
-  )
+  const { data: following } = await supabase
+    .from('follows')
+    .select('following_id')
+    .eq('follower_id', req.user.userId)
 
-  return res.json({ data: result.rows })
+  const followingIds = following?.map(f => f.following_id) || []
+  const authorIds = [req.user.userId, ...followingIds]
+
+  const { data: posts, error } = await supabase
+    .from('posts')
+    .select(`
+      id, author_id, content, created_at, updated_at,
+      users!author_id (full_name, avatar_url)
+    `)
+    .in('author_id', authorIds)
+    .order('created_at', { ascending: false })
+    .limit(100)
+
+  if (error) throw error
+
+  const postsWithLikes = await Promise.all(posts.map(async (post) => {
+    const { count } = await supabase
+      .from('post_likes')
+      .select('*', { count: 'exact', head: true })
+      .eq('post_id', post.id)
+
+    const { data: myLike } = await supabase
+      .from('post_likes')
+      .select('user_id')
+      .eq('post_id', post.id)
+      .eq('user_id', req.user.userId)
+      .single()
+
+    return {
+      id: post.id,
+      author_id: post.author_id,
+      content: post.content,
+      created_at: post.created_at,
+      updated_at: post.updated_at,
+      author_name: post.users?.full_name,
+      avatar_url: post.users?.avatar_url,
+      likes_count: count || 0,
+      liked_by_me: !!myLike
+    }
+  }))
+
+  return res.json({ data: postsWithLikes })
 }
 
 async function likePost (req, res) {
   const { postId } = req.params
 
-  const post = await pool.query('SELECT id FROM posts WHERE id = $1', [postId])
-  if (post.rowCount === 0) {
+  const { data: post, error: postError } = await supabase
+    .from('posts')
+    .select('id')
+    .eq('id', postId)
+    .single()
+
+  if (postError || !post) {
     return res.status(404).json({ message: 'Post not found' })
   }
 
-  await pool.query(
-    `INSERT INTO post_likes (user_id, post_id)
-     VALUES ($1, $2)
-     ON CONFLICT DO NOTHING`,
-    [req.user.userId, postId]
-  )
+  const { error } = await supabase
+    .from('post_likes')
+    .insert({
+      user_id: req.user.userId,
+      post_id: postId
+    })
+
+  if (error && error.code !== '23505') throw error
 
   return res.status(201).json({ message: 'Post liked' })
 }
@@ -117,10 +174,11 @@ async function likePost (req, res) {
 async function unlikePost (req, res) {
   const { postId } = req.params
 
-  await pool.query(
-    'DELETE FROM post_likes WHERE user_id = $1 AND post_id = $2',
-    [req.user.userId, postId]
-  )
+  await supabase
+    .from('post_likes')
+    .delete()
+    .eq('user_id', req.user.userId)
+    .eq('post_id', postId)
 
   return res.json({ message: 'Post unliked' })
 }

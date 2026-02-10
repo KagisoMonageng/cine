@@ -1,4 +1,4 @@
-const pool = require('../config/db')
+const supabase = require('../config/db')
 
 function mapUserRow (row) {
   return {
@@ -16,79 +16,85 @@ function mapUserRow (row) {
 }
 
 async function getMyProfile (req, res) {
-  const result = await pool.query(
-    `SELECT id, full_name, email, role, bio, institution, field_of_study, avatar_url, created_at, updated_at
-     FROM users
-     WHERE id = $1`,
-    [req.user.userId]
-  )
+  const { data, error } = await supabase
+    .from('users')
+    .select('id, full_name, email, role, bio, institution, field_of_study, avatar_url, created_at, updated_at')
+    .eq('id', req.user.userId)
+    .single()
 
-  if (result.rowCount === 0) {
+  if (error || !data) {
     return res.status(404).json({ message: 'Profile not found' })
   }
 
-  return res.json({ data: mapUserRow(result.rows[0]) })
+  return res.json({ data: mapUserRow(data) })
 }
 
 async function updateMyProfile (req, res) {
   const { fullName, bio, institution, fieldOfStudy, avatarUrl } = req.body
 
-  const current = await pool.query('SELECT * FROM users WHERE id = $1', [req.user.userId])
-  if (current.rowCount === 0) {
+  const { data: current, error: fetchError } = await supabase
+    .from('users')
+    .select('*')
+    .eq('id', req.user.userId)
+    .single()
+
+  if (fetchError || !current) {
     return res.status(404).json({ message: 'Profile not found' })
   }
 
-  const user = current.rows[0]
+  const { data, error } = await supabase
+    .from('users')
+    .update({
+      full_name: fullName || current.full_name,
+      bio: bio ?? current.bio,
+      institution: institution ?? current.institution,
+      field_of_study: fieldOfStudy ?? current.field_of_study,
+      avatar_url: avatarUrl ?? current.avatar_url,
+      updated_at: new Date().toISOString()
+    })
+    .eq('id', req.user.userId)
+    .select('id, full_name, email, role, bio, institution, field_of_study, avatar_url, created_at, updated_at')
+    .single()
 
-  const result = await pool.query(
-    `UPDATE users
-     SET full_name = $1,
-         bio = $2,
-         institution = $3,
-         field_of_study = $4,
-         avatar_url = $5,
-         updated_at = NOW()
-     WHERE id = $6
-     RETURNING id, full_name, email, role, bio, institution, field_of_study, avatar_url, created_at, updated_at`,
-    [
-      fullName || user.full_name,
-      bio ?? user.bio,
-      institution ?? user.institution,
-      fieldOfStudy ?? user.field_of_study,
-      avatarUrl ?? user.avatar_url,
-      req.user.userId
-    ]
-  )
+  if (error) throw error
 
-  return res.json({ data: mapUserRow(result.rows[0]) })
+  return res.json({ data: mapUserRow(data) })
 }
 
 async function getPublicProfile (req, res) {
   const { userId } = req.params
 
-  const profileResult = await pool.query(
-    `SELECT id, full_name, role, bio, institution, field_of_study, avatar_url, created_at
-     FROM users
-     WHERE id = $1`,
-    [userId]
-  )
+  const { data: profile, error: profileError } = await supabase
+    .from('users')
+    .select('id, full_name, role, bio, institution, field_of_study, avatar_url, created_at')
+    .eq('id', userId)
+    .single()
 
-  if (profileResult.rowCount === 0) {
+  if (profileError || !profile) {
     return res.status(404).json({ message: 'User not found' })
   }
 
-  const statsResult = await pool.query(
-    `SELECT
-      (SELECT COUNT(*) FROM follows WHERE following_id = $1) AS followers_count,
-      (SELECT COUNT(*) FROM follows WHERE follower_id = $1) AS following_count,
-      (SELECT COUNT(*) FROM posts WHERE author_id = $1) AS posts_count`,
-    [userId]
-  )
+  const { count: followersCount } = await supabase
+    .from('follows')
+    .select('*', { count: 'exact', head: true })
+    .eq('following_id', userId)
+
+  const { count: followingCount } = await supabase
+    .from('follows')
+    .select('*', { count: 'exact', head: true })
+    .eq('follower_id', userId)
+
+  const { count: postsCount } = await supabase
+    .from('posts')
+    .select('*', { count: 'exact', head: true })
+    .eq('author_id', userId)
 
   return res.json({
     data: {
-      ...profileResult.rows[0],
-      ...statsResult.rows[0]
+      ...profile,
+      followers_count: followersCount || 0,
+      following_count: followingCount || 0,
+      posts_count: postsCount || 0
     }
   })
 }

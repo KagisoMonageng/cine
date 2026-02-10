@@ -1,5 +1,5 @@
 const bcrypt = require('bcrypt')
-const pool = require('../config/db')
+const supabase = require('../config/db')
 const { signToken } = require('../utils/jwt')
 
 const allowedRoles = new Set(['learner', 'provider'])
@@ -31,17 +31,21 @@ async function register (req, res) {
 
   const passwordHash = await bcrypt.hash(password, 12)
 
-  const query = `
-    INSERT INTO users (full_name, email, password_hash, role)
-    VALUES ($1, $2, $3, $4)
-    RETURNING id, full_name, email, role, bio, institution, field_of_study, avatar_url, created_at
-  `
+  const { data, error } = await supabase
+    .from('users')
+    .insert({
+      full_name: fullName,
+      email: email.toLowerCase(),
+      password_hash: passwordHash,
+      role
+    })
+    .select()
+    .single()
 
-  const result = await pool.query(query, [fullName, email.toLowerCase(), passwordHash, role])
-  const user = result.rows[0]
-  const token = signToken({ userId: user.id, role: user.role })
+  if (error) throw error
 
-  return res.status(201).json({ user: sanitizeUser(user), token })
+  const token = signToken({ userId: data.id, role: data.role })
+  return res.status(201).json({ user: sanitizeUser(data), token })
 }
 
 async function login (req, res) {
@@ -51,23 +55,23 @@ async function login (req, res) {
     return res.status(400).json({ message: 'email and password are required' })
   }
 
-  const result = await pool.query(
-    'SELECT id, full_name, email, role, bio, institution, field_of_study, avatar_url, password_hash, created_at FROM users WHERE email = $1',
-    [email.toLowerCase()]
-  )
+  const { data, error } = await supabase
+    .from('users')
+    .select('id, full_name, email, role, bio, institution, field_of_study, avatar_url, password_hash, created_at')
+    .eq('email', email.toLowerCase())
+    .single()
 
-  const user = result.rows[0]
-  if (!user) {
+  if (error || !data) {
     return res.status(401).json({ message: 'Invalid credentials' })
   }
 
-  const isMatch = await bcrypt.compare(password, user.password_hash)
+  const isMatch = await bcrypt.compare(password, data.password_hash)
   if (!isMatch) {
     return res.status(401).json({ message: 'Invalid credentials' })
   }
 
-  const token = signToken({ userId: user.id, role: user.role })
-  return res.json({ user: sanitizeUser(user), token })
+  const token = signToken({ userId: data.id, role: data.role })
+  return res.json({ user: sanitizeUser(data), token })
 }
 
 module.exports = {
